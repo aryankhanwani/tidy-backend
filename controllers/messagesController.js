@@ -102,7 +102,7 @@ const getConversation = async (req, res) => {
  * 
  * Access Rules:
  * - Housekeepers can see ALL owners
- * - Owners can only see housekeepers they have messaged with (conversation history)
+ * - Owners can see ALL other owners and housekeepers they have messaged with
  */
 const getUsers = async (req, res) => {
   try {
@@ -138,8 +138,21 @@ const getUsers = async (req, res) => {
       }
       profiles = data || [];
     } else if (currentUserRole === 'owner') {
-      // Owners can only see housekeepers they have messaged with
-      // Get all housekeepers who have messaged with this owner OR have received messages from this owner
+      // Owners can see ALL other owners
+      // Get all owners first
+      const { data: allOwners, error: ownersError } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('role', 'owner')
+        .neq('user_id', authenticatedUserId)
+        .order('name', { ascending: true });
+
+      if (ownersError) {
+        throw ownersError;
+      }
+
+      // Get housekeepers they have messaged with
+      // Get all users who have messaged with this owner OR have received messages from this owner
       const { data: messageData, error: messageError } = await supabase
         .from('messages')
         .select('sender_id, receiver_id')
@@ -162,6 +175,7 @@ const getUsers = async (req, res) => {
       }
 
       // Get profiles of housekeepers that the owner has conversed with
+      let conversedHousekeepers = [];
       if (conversedUserIds.size > 0) {
         const { data, error } = await supabase
           .from('profiles')
@@ -173,8 +187,11 @@ const getUsers = async (req, res) => {
         if (error) {
           throw error;
         }
-        profiles = data || [];
+        conversedHousekeepers = data || [];
       }
+
+      // Combine all owners with housekeepers they've conversed with
+      profiles = [...(allOwners || []), ...conversedHousekeepers];
     }
 
     console.log('Returning profiles:', profiles?.length || 0);
@@ -258,7 +275,7 @@ const sendMessage = async (req, res) => {
 
     const senderRole = senderProfile.role;
 
-    // If sender is owner, verify they can message this housekeeper
+    // If sender is owner, apply messaging restrictions
     if (senderRole === 'owner') {
       // Get receiver's role
       const { data: receiverProfile, error: receiverProfileError } = await supabase
@@ -274,6 +291,7 @@ const sendMessage = async (req, res) => {
         });
       }
 
+      // Owners can message other owners freely, but need existing conversation for housekeepers
       // If owner is trying to message a housekeeper, verify there's existing conversation
       if (receiverProfile.role === 'housekeeper') {
         // Check if there's any message between these two users
