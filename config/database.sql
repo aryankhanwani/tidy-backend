@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
     receiver_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
     message TEXT NOT NULL,
+    deleted_for_sender BOOLEAN DEFAULT FALSE,
+    deleted_for_receiver BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW()
 );
 

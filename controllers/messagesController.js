@@ -53,23 +53,25 @@ const getConversation = async (req, res) => {
     const { otherUserId } = req.params;
     const authenticatedUserId = req.user.userId;
 
-    // Get messages where user is sender and other is receiver
+    // Get messages where user is sender and other is receiver (not deleted for sender)
     const { data: sentMessages, error: sentError } = await supabase
       .from('messages')
       .select('*')
       .eq('sender_id', authenticatedUserId)
-      .eq('receiver_id', otherUserId);
+      .eq('receiver_id', otherUserId)
+      .eq('deleted_for_sender', false);
 
     if (sentError) {
       throw sentError;
     }
 
-    // Get messages where user is receiver and other is sender
+    // Get messages where user is receiver and other is sender (not deleted for receiver)
     const { data: receivedMessages, error: receivedError } = await supabase
       .from('messages')
       .select('*')
       .eq('sender_id', otherUserId)
-      .eq('receiver_id', authenticatedUserId);
+      .eq('receiver_id', authenticatedUserId)
+      .eq('deleted_for_receiver', false);
 
     if (receivedError) {
       throw receivedError;
@@ -97,24 +99,82 @@ const getConversation = async (req, res) => {
 /**
  * Get list of users for chat (excluding current user)
  * GET /api/messages/users
+ * 
+ * Access Rules:
+ * - Housekeepers can see ALL owners
+ * - Owners can only see housekeepers they have messaged with (conversation history)
  */
 const getUsers = async (req, res) => {
   try {
     const authenticatedUserId = req.user.userId;
     console.log('Fetching users for authenticated user:', authenticatedUserId);
 
-    // Get all profiles, excluding current user
-    const { data: profiles, error } = await supabase
+    // First, get the current user's role
+    const { data: currentProfile, error: profileError } = await supabase
       .from('profiles')
-      .select('*')
-      .neq('user_id', authenticatedUserId)
-      .order('name', { ascending: true });
+      .select('role')
+      .eq('user_id', authenticatedUserId)
+      .single();
 
-    console.log('Supabase query result:', { profiles, error });
+    if (profileError || !currentProfile) {
+      throw new Error('Could not find user profile');
+    }
 
-    if (error) {
-      console.error('Supabase error:', error);
-      throw error;
+    const currentUserRole = currentProfile.role;
+
+    let profiles = [];
+
+    if (currentUserRole === 'housekeeper') {
+      // Housekeepers can see ALL owners
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('role', 'owner')
+        .neq('user_id', authenticatedUserId)
+        .order('name', { ascending: true });
+
+      if (error) {
+        throw error;
+      }
+      profiles = data || [];
+    } else if (currentUserRole === 'owner') {
+      // Owners can only see housekeepers they have messaged with
+      // Get all housekeepers who have messaged with this owner OR have received messages from this owner
+      const { data: messageData, error: messageError } = await supabase
+        .from('messages')
+        .select('sender_id, receiver_id')
+        .or(`sender_id.eq.${authenticatedUserId},receiver_id.eq.${authenticatedUserId}`);
+
+      if (messageError) {
+        throw messageError;
+      }
+
+      // Extract unique user IDs that the owner has conversed with
+      const conversedUserIds = new Set();
+      if (messageData) {
+        messageData.forEach(msg => {
+          if (msg.sender_id === authenticatedUserId) {
+            conversedUserIds.add(msg.receiver_id);
+          } else if (msg.receiver_id === authenticatedUserId) {
+            conversedUserIds.add(msg.sender_id);
+          }
+        });
+      }
+
+      // Get profiles of housekeepers that the owner has conversed with
+      if (conversedUserIds.size > 0) {
+        const { data, error } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('role', 'housekeeper')
+          .in('user_id', Array.from(conversedUserIds))
+          .order('name', { ascending: true });
+
+        if (error) {
+          throw error;
+        }
+        profiles = data || [];
+      }
     }
 
     console.log('Returning profiles:', profiles?.length || 0);
@@ -182,6 +242,72 @@ const sendMessage = async (req, res) => {
       });
     }
 
+    // Get sender's role to enforce access rules
+    const { data: senderProfile, error: senderProfileError } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('user_id', sender_id)
+      .single();
+
+    if (senderProfileError || !senderProfile) {
+      return res.status(400).json({
+        success: false,
+        message: 'Sender profile not found'
+      });
+    }
+
+    const senderRole = senderProfile.role;
+
+    // If sender is owner, verify they can message this housekeeper
+    if (senderRole === 'owner') {
+      // Get receiver's role
+      const { data: receiverProfile, error: receiverProfileError } = await supabase
+        .from('profiles')
+        .select('role')
+        .eq('user_id', receiver_id)
+        .single();
+
+      if (receiverProfileError || !receiverProfile) {
+        return res.status(404).json({
+          success: false,
+          message: 'Receiver not found'
+        });
+      }
+
+      // If owner is trying to message a housekeeper, verify there's existing conversation
+      if (receiverProfile.role === 'housekeeper') {
+        // Check if there's any message between these two users
+        const { data: sentMessages, error: sentError } = await supabase
+          .from('messages')
+          .select('id')
+          .eq('sender_id', sender_id)
+          .eq('receiver_id', receiver_id)
+          .limit(1);
+
+        const { data: receivedMessages, error: receivedError } = await supabase
+          .from('messages')
+          .select('id')
+          .eq('sender_id', receiver_id)
+          .eq('receiver_id', sender_id)
+          .limit(1);
+
+        if (sentError || receivedError) {
+          throw sentError || receivedError;
+        }
+
+        // Only allow if there's an existing conversation (housekeeper initiated or previous messages)
+        const hasConversation = (sentMessages && sentMessages.length > 0) || 
+                                (receivedMessages && receivedMessages.length > 0);
+
+        if (!hasConversation) {
+          return res.status(403).json({
+            success: false,
+            message: 'You can only message housekeepers who have messaged you first'
+          });
+        }
+      }
+    }
+
     // Insert message
     const { data: newMessage, error: insertError } = await supabase
       .from('messages')
@@ -213,10 +339,97 @@ const sendMessage = async (req, res) => {
   }
 };
 
+/**
+ * Delete a message
+ * DELETE /api/messages/:messageId
+ */
+const deleteMessage = async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const authenticatedUserId = req.user.userId;
+    const { deleteForEveryone } = req.body;
+
+    // Get the message
+    const { data: message, error: fetchError } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('id', messageId)
+      .single();
+
+    if (fetchError || !message) {
+      return res.status(404).json({
+        success: false,
+        message: 'Message not found'
+      });
+    }
+
+    // Verify user has permission (must be sender or receiver)
+    if (message.sender_id !== authenticatedUserId && message.receiver_id !== authenticatedUserId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Unauthorized to delete this message'
+      });
+    }
+
+    if (deleteForEveryone === true) {
+      // Only sender can delete for everyone
+      if (message.sender_id !== authenticatedUserId) {
+        return res.status(403).json({
+          success: false,
+          message: 'Only the sender can delete messages for everyone'
+        });
+      }
+
+      // Delete for everyone - mark as deleted for both
+      const { error: deleteError } = await supabase
+        .from('messages')
+        .update({
+          deleted_for_sender: true,
+          deleted_for_receiver: true
+        })
+        .eq('id', messageId);
+
+      if (deleteError) {
+        throw deleteError;
+      }
+    } else {
+      // Delete for me only
+      const updateData = {};
+      if (message.sender_id === authenticatedUserId) {
+        updateData.deleted_for_sender = true;
+      } else {
+        updateData.deleted_for_receiver = true;
+      }
+
+      const { error: deleteError } = await supabase
+        .from('messages')
+        .update(updateData)
+        .eq('id', messageId);
+
+      if (deleteError) {
+        throw deleteError;
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: deleteForEveryone ? 'Message deleted for everyone' : 'Message deleted for you'
+    });
+
+  } catch (error) {
+    console.error('Delete message error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting message',
+      error: error.message
+    });
+  }
+};
+
 module.exports = {
   getMessages,
   getConversation,
   getUsers,
-  sendMessage
+  sendMessage,
+  deleteMessage
 };
-

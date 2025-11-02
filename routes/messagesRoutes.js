@@ -5,7 +5,8 @@ const {
   getMessages,
   getConversation,
   getUsers,
-  sendMessage
+  sendMessage,
+  deleteMessage
 } = require('../controllers/messagesController');
 
 // All routes require authentication
@@ -19,6 +20,9 @@ router.get('/conversation/:otherUserId', getConversation);
 
 // Send a new message
 router.post('/', sendMessage);
+
+// Delete a message - MUST be before :userId route to avoid conflicts
+router.delete('/:messageId', deleteMessage);
 
 // Get all messages for a user - This must be LAST because it has a catch-all :userId param
 router.get('/:userId', getMessages);
