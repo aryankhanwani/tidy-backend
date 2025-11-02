@@ -96,7 +96,7 @@ The token contains:
 ## How to Use the Token
 
 ### 1. Client-side (Frontend)
-Store the token after login:
+Store the token after login:a
 ```javascript
 // After login API call
 const response = await fetch('/api/auth/login', {
